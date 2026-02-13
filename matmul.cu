@@ -47,6 +47,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem)
 
+#define TILE_DIM 32
+
 namespace matmul_l1 {
 
 __global__ void matmul_l1(
@@ -56,7 +58,39 @@ __global__ void matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+    
+    // declare dynamic shared mem
+    extern __shared__ float s_mem[];
+    float* tileA = s_mem;
+    float* tileB = &s_mem[TILE_DIM * TILE_DIM];
+
+    int global_row = blockIdx.y * blockDim.y + threadIdx.y;
+    int global_col = blockIdx.x * blockDim.x + threadIdx.x;
+    float accum = 0.0f;
+
+    for (int ph = 0; ph < size_k; ph += TILE_DIM) {
+        // threads collaboratively load a tile from a and a tile from b
+        if ((global_row < size_i && ph + threadIdx.x < size_k ) && ((global_col < size_j && ph + threadIdx.y < size_k))) {
+            tileA[threadIdx.y * TILE_DIM + threadIdx.x] = a[global_row * size_k + (ph + threadIdx.x)];
+            tileB[threadIdx.y * TILE_DIM + threadIdx.x] = b[(ph + threadIdx.y) * size_j + global_col];
+        }
+
+        // we have to finish loading before we do compute
+        __syncthreads();
+
+        // do compute
+        for (int k = 0; k < TILE_DIM; k++) {
+            accum += tileA[threadIdx.y * TILE_DIM + k] * tileB[k * TILE_DIM + threadIdx.x];
+        }
+
+        // finish compute before loading in next tiles
+        __syncthreads();
+    }
+
+    // write results to DRAM
+    if (global_row < size_i && global_col < size_j) {
+        c[global_row * size_j + global_col] = accum;
+    }
 }
 
 void launch_matmul_l1(
@@ -66,7 +100,13 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+
+    // let's assume that we have 100KB of shared mem; we want to fit as much of mat A and mat B onto the scratchpad as we can
+    
+    dim3 threadsPerBlock = dim3(32, 32);
+    dim3 numBlocks = dim3((size_i + threadsPerBlock.y - 1) / threadsPerBlock.y, (size_j + threadsPerBlock.x - 1) / threadsPerBlock.x);
+    uint32_t shmem_size_bytes = 2 * TILE_DIM * TILE_DIM * sizeof(float);
+    matmul_l1<<<numBlocks, threadsPerBlock, shmem_size_bytes>>>(size_i, size_j, size_k, a, b, c);
 }
 
 }; // namespace matmul_l1
